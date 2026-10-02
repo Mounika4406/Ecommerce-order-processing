@@ -1,29 +1,29 @@
 # Legacy E-Commerce Service: Debugging & Refactoring Report
 
-This report provides a comprehensive technical audit of the defects diagnosed within the inherited legacy e-commerce order processing service, detailing the root causes, empirical reproduction mechanisms, and the architectural refactoring solutions applied to achieve production-grade stability and performance.
+This report provides a comprehensive technical audit of the defects diagnosed within the inherited legacy e-commerce order processing service, detailing the root causes, empirical reproduction mechanisms, and the architectural refactoring solutions applied to achieve production-grade stability, ACID transaction guarantees, and high-throughput performance.
 
 ---
 
 ## Race Condition
 
 ### Root Cause
-In the legacy order checkout flow, the inventory deduction mechanism employed a non-atomic read-modify-write pattern executed entirely in application memory. When a customer initiated a checkout, the application performed a simple `SELECT stock FROM products WHERE id = $1` query, retrieved the current stock integer, decremented the value in memory (`newStock = stock - quantity`), and subsequently issued an `UPDATE products SET stock = $newStock WHERE id = $1`. In a multi-threaded or asynchronous concurrent environment, when multiple simultaneous requests (e.g., 50 concurrent buyers) attempt to purchase units of a limited stock product, multiple requests read the exact same initial stock value before any write operation is committed to the database. Consequently, independent transactions overwrite each other’s decrements, missing purchases in the inventory ledger and resulting in severe overselling where available inventory falls below zero.
+In the legacy order checkout flow, the inventory deduction mechanism employed a non-atomic read-modify-write pattern executed entirely in application memory. When a customer initiated a checkout, the application performed a simple `SELECT stock FROM products WHERE id = $1` query, retrieved the current stock integer, decremented the value in memory (`newStock = stock - quantity`), and subsequently issued an `UPDATE products SET stock = $newStock WHERE id = $1`. In an asynchronous concurrent environment, when multiple simultaneous requests (e.g., 50 concurrent buyers) attempt to purchase units of a limited-stock product, multiple requests read the exact same initial stock value before any write operation is committed to the database. Consequently, independent transactions overwrite each other’s decrements, missing purchases in the inventory ledger and resulting in severe overselling where available inventory falls below zero.
 
 ### Resolution
-The race condition was resolved at the persistence layer by implementing atomic database operations and database-level constraint enforcement. Rather than calculating stock values in Node.js memory, the inventory update was converted into an indivisible atomic SQL operation:
+The race condition was resolved at the persistence layer by implementing atomic conditional database operations and database-level constraint enforcement within explicit transaction boundaries. Rather than calculating stock values in Node.js memory, the inventory update was converted into an indivisible atomic SQL operation:
 ```sql
 UPDATE products 
 SET stock = stock - $1, updated_at = CURRENT_TIMESTAMP 
 WHERE id = $2 AND stock >= $1;
 ```
-By embedding the conditional predicate `AND stock >= $1` directly inside the database engine's row-level lock execution, the database guarantees that the stock is only decremented if sufficient quantity is available. If two concurrent transactions target the same row, the database serializes their updates; once available inventory drops below the requested quantity, subsequent queries return a row count of zero. The application layer detects `rowCount === 0` and immediately halts order processing, issuing an HTTP 409 Conflict / 400 Bad Request error. Furthermore, a database `CHECK (stock >= 0)` constraint was added to enforce data integrity unconditionally at the schema level.
+By embedding the conditional predicate `AND stock >= $1` directly inside the database engine's row-level lock execution, the database guarantees that stock is only decremented if sufficient quantity is available. If two concurrent transactions target the same row, the database serializes their updates; once available inventory drops below the requested quantity, subsequent queries return a row count of zero. The application layer detects `rowCount === 0` and immediately halts order processing, issuing an HTTP 409 Conflict / 400 Bad Request error. Furthermore, a database `CHECK (stock >= 0)` constraint was added to enforce data integrity unconditionally at the schema level.
 
 ---
 
 ## Memory Leak
 
 ### Root Cause
-The data processing subsystem accessible via `POST /process-data` exhibited continuous heap growth under sustained traffic, leading to inevitable Out-Of-Memory (OOM) fatal crashes. Profiling revealed that each incoming request registered event listeners on a shared `EventEmitter` instance (`processorEmitter.on('data_processed', ...)`) without detaching or cleaning them up upon request completion. Additionally, request payloads were being pushed into an unbounded module-level array buffer that acted as an accidental memory retention root. Because Node.js event listeners retain references to their enclosing closure scopes, every request retained garbage-collector-resistant closures and buffer allocations, causing the application heap footprint to increase linearly with each request until process termination.
+The data processing subsystem accessible via `POST /process-data` exhibited continuous heap growth under sustained traffic, leading to eventual Out-Of-Memory (OOM) fatal crashes. Profiling revealed that each incoming request registered event listeners on a shared `EventEmitter` instance (`processorEmitter.on('data_processed', ...)`) without detaching or cleaning them up upon request completion. Additionally, request payloads were being pushed into an unbounded module-level array buffer that acted as an accidental memory retention root. Because Node.js event listeners retain references to their enclosing closure scopes, every request retained garbage-collector-resistant closures and buffer allocations, causing the application heap footprint to increase linearly with each request until process termination.
 
 ### Resolution
 The memory leak was plugged by enforcing strict resource lifecycle management and eliminating unbounded retention roots. The event handling was refactored to use one-time ephemeral handlers via `processorEmitter.once('finish_task', ...)` that automatically detach the listener immediately following callback execution. Furthermore, the unbounded in-memory array accumulation was eliminated, replacing persistent accumulation with stream-based processing and deterministic teardown. A 10,000-request load test benchmark (`scripts/load-test-memory.js`) confirmed that memory consumption stabilizes after garbage collection triggers, with heap growth restricted to 14.31% (well below the 15% maximum threshold contract).
@@ -69,11 +69,17 @@ The logic was validated against a comprehensive parameterized test matrix coveri
 ## Code Quality
 
 ### Root Cause
-The legacy codebase suffered from high coupling and monolithic design anti-patterns. The primary order processing function spanned extensive lines of code, conflating HTTP transport concerns (parsing request headers, setting HTTP status codes) directly with database query execution and business logic. Cryptic variable identifiers (such as `t`, `d`, `p`, and `r`) obscured developer comprehension and raised technical debt. No static analysis or linting rules were configured, leading to unused variables, potential variable shadowing, and unhandled asynchronous promise rejections.
+The legacy codebase suffered from high coupling, absence of multi-statement ACID transaction boundaries, and missing critical business endpoints. In particular:
+- Operations involving multiple database writes (inventory decrement, order insertion, line item creation, and payment recording) were executed across disjointed queries without explicit transaction controls (`BEGIN`/`COMMIT`/`ROLLBACK`), risking partial writes and orphaned records upon failure.
+- Core e-commerce management endpoints (`GET /api/products`, `GET /api/orders/:orderId`, and `PUT /api/orders/:orderId/cancel`) were entirely absent.
+- The health check returned a static status without testing database connectivity.
+- Hardcoded database credentials were embedded in `docker-compose.yml`, and database seeding was coupled inside application startup rather than utilizing native container initialization (`/docker-entrypoint-initdb.d`).
 
 ### Resolution
-The application architecture was refactored into a clean layered model:
-- **Routing & HTTP Controllers (`src/controllers/`)**: Responsible exclusively for validating request schemas, extracting parameters, and formatting HTTP 200/201/400/409 responses.
-- **Domain Services (`src/services/`)**: Encapsulates pure business logic (pricing, concurrency rules, order orchestration). The primary order processing function `processCheckout` was refactored to 30 lines of readable code, well below the 50-line contract ceiling.
-- **Data Access Models (`src/models/`)**: Encapsulates persistence queries and SQL parameterization.
-- **Naming Conventions & Linting**: All variables were renamed to expressive domain terminology (`totalAmount`, `discountRate`, `customerName`, `productId`). An ESLint configuration was introduced (`eslint.config.js`), and all code was verified to produce **0 warnings and 0 errors**.
+The codebase was refactored into a hardened, modular 3-tier architecture with full ACID compliance and complete API surface:
+- **Explicit ACID Transaction Management**: Implemented `beginTransaction()`, `commitTransaction(client)`, and `rollbackTransaction(client)` in `src/config/database.js`. In `orderService.js`, both checkout (`processCheckout`) and cancellation (`cancelOrder`) are wrapped inside explicit `try...catch` blocks that execute `BEGIN`, commit upon all successful writes, and issue `ROLLBACK` on any error before releasing the client.
+- **Idempotent Order Cancellation**: Implemented `PUT /api/orders/:orderId/cancel` which atomically restores inventory (`UPDATE products SET stock = stock + $qty`) and checks if an order is already cancelled to prevent double inventory restoration.
+- **Complete Endpoint Coverage**: Implemented `GET /api/products` (and `GET /products`), `GET /api/orders/:orderId` with nested item/user joins, and enhanced `GET /health` with active database pinging (`SELECT 1`).
+- **Decoupled Payment Gateway Service**: Implemented `src/services/paymentService.js` simulating third-party payment transactions and persisting payment records in a dedicated `payments` table.
+- **Automated Docker Seeding & Secrets Cleanliness**: Removed all hardcoded credentials; introduced `db_init/` SQL initialization scripts mounted to `/docker-entrypoint-initdb.d:ro` in `docker-compose.yml`, seeding $\ge 2$ users and $\ge 5$ products (including one with 0 stock).
+- **ESLint & Static Analysis**: Main order processing functions are modular ($\le 50$ LOC), variables use expressive domain terms, and ESLint verifies **0 warnings and 0 errors**.

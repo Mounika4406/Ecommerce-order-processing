@@ -1,27 +1,15 @@
-﻿import dotenv from 'dotenv';
+import dotenv from 'dotenv';
 import { app } from './app.js';
 import { initDb, closeDb } from './config/database.js';
-import * as productModel from './models/productModel.js';
 
 dotenv.config();
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || process.env.API_PORT || 3000;
 
 async function start() {
   try {
     await initDb();
     console.log('Database initialized successfully');
-
-    // Seed default product if empty for easy development/testing
-    const products = await productModel.getAllProducts();
-    if (products.length === 0) {
-      await productModel.createProduct({
-        name: 'Standard E-Commerce Widget',
-        price: 25.0,
-        stock: 100,
-      });
-      console.log('Default product seeded (Stock: 100)');
-    }
 
     const server = app.listen(PORT, () => {
       console.log(`E-Commerce Order Service listening on port ${PORT}`);
